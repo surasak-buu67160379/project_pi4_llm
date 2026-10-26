@@ -4,6 +4,7 @@ import requests
 import json
 import re
 import html
+import os
 import sqlite3
 from datetime import datetime
 
@@ -146,6 +147,7 @@ button[data-baseweb="tab"][aria-selected="true"] { background:var(--paper); colo
 # ==========================================
 # DATABASE SETUP
 # ==========================================
+@st.cache_resource
 def init_db():
     conn = sqlite3.connect("room_inspection.db", check_same_thread=False)
     cursor = conn.cursor()
@@ -164,9 +166,16 @@ def init_db():
             final_deduct INTEGER,
             final_remaining INTEGER,
             ai_analysis TEXT,
-            created_at TEXT
+            created_at TEXT,
+            category_key TEXT,
+            image_path TEXT
         )
     """)
+    # เพิ่มคอลัมน์ใหม่ให้ฐานข้อมูลเดิม (ถ้ายังไม่มี)
+    existing_cols = [row[1] for row in cursor.execute("PRAGMA table_info(inspections)")]
+    for col in ("category_key", "image_path"):
+        if col not in existing_cols:
+            cursor.execute(f"ALTER TABLE inspections ADD COLUMN {col} TEXT")
     conn.commit()
     return conn
 
@@ -179,6 +188,13 @@ CATEGORY_MAP = {
     "sanitation":       "สุขภัณฑ์และความสะอาด",
     "Wall":             "ผนังและกำแพง"
 }
+
+STATUS_PENDING = "🟡 รอการตรวจสอบ"
+STATUS_DONE = "🟢 ประเมินเสร็จสิ้น"
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "qwen2.5:0.5b"
+OLLAMA_TIMEOUT = 180  # วินาที
+UPLOAD_DIR = "uploads"
 
 # Demo accounts: username -> (password, role, display_name, room_no)
 USERS = {
@@ -195,6 +211,8 @@ def load_cost_db():
         return pd.DataFrame()
 
 cost_df = load_cost_db()
+if cost_df.empty:
+    st.warning("ไม่พบหรืออ่านไฟล์ repair_cost_db.csv ไม่ได้ AI จะประเมินโดยไม่มีเรทราคาอ้างอิง")
 
 # ==========================================
 # SESSION STATE INIT
@@ -281,7 +299,7 @@ def render_login():
         with st.form("login_form"):
             username_input = st.text_input("Username", placeholder="เช่น tenant01 / landlord")
             password_input = st.text_input("Password", type="password", placeholder="รหัสผ่าน")
-            if st.form_submit_button("&#128274; เข้าสู่ระบบ", type="primary", use_container_width=True):
+            if st.form_submit_button("🔒 เข้าสู่ระบบ", type="primary", use_container_width=True):
                 if do_login(username_input.strip(), password_input.strip()):
                     st.rerun()
                 else:
@@ -301,7 +319,7 @@ def render_login():
 # ==========================================
 def render_topbar():
     role  = st.session_state.role
-    name  = st.session_state.display_name
+    name  = html.escape(st.session_state.display_name or "")
     badge = "#0D9488" if role == "tenant" else "#C99B3E"
     label = "ผู้เช่า" if role == "tenant" else "เจ้าของห้อง"
     icon  = "🏠" if role == "tenant" else "🏢"
@@ -323,19 +341,23 @@ def render_topbar():
             for k in ["logged_in","role","username","display_name","room_no","quick_login"]:
                 st.session_state[k] = None
             st.session_state.logged_in = False
+            for k in ["draft", "result", "tenant_flash"]:
+                st.session_state.pop(k, None)
             st.rerun()
 
 # ==========================================
 # TENANT DASHBOARD
 # ==========================================
 def render_tenant():
-    name = st.session_state.display_name
-    room = st.session_state.room_no or "—"
+    name_db = st.session_state.display_name
+    room_db = st.session_state.room_no or "—"
+    name = html.escape(name_db)   # ใช้แสดงผลใน HTML (ป้องกันการแทรก HTML)
+    room = html.escape(room_db)
     cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*), COALESCE(SUM(final_remaining),0), COALESCE(SUM(final_deduct),0) FROM inspections WHERE tenant_name=?", (name,))
+    cursor.execute("SELECT COUNT(*), COALESCE(SUM(final_remaining),0), COALESCE(SUM(final_deduct),0) FROM inspections WHERE tenant_name=?", (name_db,))
     tc, trem, tded = cursor.fetchone()
-    cursor.execute("SELECT COUNT(*) FROM inspections WHERE tenant_name=? AND status='🟡 รอการตรวจสอบ'", (name,))
+    cursor.execute("SELECT COUNT(*) FROM inspections WHERE tenant_name=? AND status=?", (name_db, STATUS_PENDING))
     tpend = cursor.fetchone()[0]
 
     st.markdown(f"""
@@ -359,6 +381,10 @@ def render_tenant():
     </div>
     """, unsafe_allow_html=True)
 
+    flash = st.session_state.pop("tenant_flash", None)
+    if flash:
+        st.success(flash)
+
     tab_form, tab_status = st.tabs(["📋 แจ้งย้ายออก / รายงานความเสียหาย", "📊 สถานะเคสของฉัน"])
 
     with tab_form:
@@ -368,28 +394,41 @@ def render_tenant():
         with st.form("tenant_form"):
             col1, col2 = st.columns(2)
             with col1:
-                tenant_name_val = st.text_input("ชื่อ-นามสกุล ผู้เช่า:", name)
-                room_no_val     = st.text_input("หมายเลขห้องพัก:", room)
-                initial_deposit = st.number_input("ยอดเงินประกันที่วางไว้ (บาท):", value=5000, step=500)
+                # ชื่อและห้องมาจากบัญชีที่ล็อกอิน ไม่ให้แก้ในฟอร์ม
+                st.text_input("ชื่อ-นามสกุล ผู้เช่า:", name_db, disabled=True)
+                st.text_input("หมายเลขห้องพัก:", room_db, disabled=True)
+                initial_deposit = st.number_input("ยอดเงินประกันที่วางไว้ (บาท):", min_value=0, value=5000, step=500)
             with col2:
                 category_th     = st.selectbox("หมวดหมู่จุดที่เสียหาย:", list(CATEGORY_MAP.values()))
+                category_key    = next((k for k, v in CATEGORY_MAP.items() if v == category_th), None)
                 location_detail = st.text_input("ตำแหน่งภายในห้อง:", placeholder="เช่น ผนังห้องนอน / พื้นห้องนั่งเล่น")
             issue_description = st.text_area("รายละเอียดความเสียหาย:", placeholder="อธิบายลักษณะความเสียหายที่พบ...", height=110)
-            st.file_uploader("แนบรูปถ่ายจุดที่เสียหาย (ถ้ามี):", type=["jpg","jpeg","png"])
+            uploaded_image = st.file_uploader("แนบรูปถ่ายจุดที่เสียหาย (ถ้ามี):", type=["jpg","jpeg","png"])
 
             if st.form_submit_button("📤 ส่งเรื่องแจ้งย้ายออก", type="primary", use_container_width=True):
-                if not issue_description.strip():
-                    st.error("กรุณากรอกรายละเอียดความเสียหาย")
+                if not (location_detail.strip() and issue_description.strip()):
+                    st.error("กรุณากรอกตำแหน่งภายในห้องและรายละเอียดความเสียหายให้ครบ")
                 else:
+                    # บันทึกรูปที่แนบลงโฟลเดอร์ แล้วเก็บ path ลงฐานข้อมูล
+                    image_path = None
+                    if uploaded_image is not None:
+                        os.makedirs(UPLOAD_DIR, exist_ok=True)
+                        ext = os.path.splitext(uploaded_image.name)[1].lower()
+                        safe_room = re.sub(r"[^A-Za-z0-9_-]", "_", room_db)
+                        image_path = os.path.join(UPLOAD_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_room}{ext}")
+                        with open(image_path, "wb") as f:
+                            f.write(uploaded_image.getbuffer())
+
                     cur2 = conn.cursor()
                     cur2.execute("""
                         INSERT INTO inspections
-                          (room_no,tenant_name,deposit,category_th,location,description,status,mat_cost,lab_cost,final_deduct,final_remaining,ai_analysis,created_at)
-                        VALUES (?,?,?,?,?,?,'🟡 รอการตรวจสอบ',0,0,0,0,'รอดำเนินการตรวจสอบ',?)
-                    """, (room_no_val, tenant_name_val, initial_deposit, category_th, location_detail,
-                          issue_description, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                          (room_no,tenant_name,deposit,category_th,category_key,location,description,status,mat_cost,lab_cost,final_deduct,final_remaining,ai_analysis,image_path,created_at)
+                        VALUES (?,?,?,?,?,?,?,?,0,0,0,0,'รอดำเนินการตรวจสอบ',?,?)
+                    """, (room_db, name_db, initial_deposit, category_th, category_key, location_detail.strip(),
+                          issue_description.strip(), STATUS_PENDING, image_path,
+                          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                     conn.commit()
-                    st.success("🎉 ส่งเรื่องแจ้งย้ายออกสำเร็จ!")
+                    st.session_state["tenant_flash"] = "🎉 ส่งเรื่องแจ้งย้ายออกสำเร็จ! ข้อมูลถูกบันทึกและส่งให้เจ้าของห้องแล้ว"
                     st.rerun()
 
         st.markdown('</div>', unsafe_allow_html=True)
@@ -399,7 +438,7 @@ def render_tenant():
         st.markdown('<div class="section-title">📊 สถานะเคสทั้งหมดของคุณ</div>', unsafe_allow_html=True)
         cursor.execute(
             "SELECT id,room_no,category_th,status,deposit,final_deduct,final_remaining,created_at FROM inspections WHERE tenant_name=? ORDER BY id DESC",
-            (name,)
+            (name_db,)
         )
         my_cases = cursor.fetchall()
         if not my_cases:
@@ -407,15 +446,15 @@ def render_tenant():
         else:
             for c in my_cases:
                 cid, rno, cat, status, dep, deduct, remaining, created = c
-                pill = "done" if "เสร็จ" in status else "pending"
+                pill = "done" if status == STATUS_DONE else "pending"
                 st.markdown(f"""
                 <div class="tenant-status-card">
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
-                        <div><span class="room-badge">ห้อง {rno}</span>&nbsp;<span style="color:var(--muted);font-size:.85rem;">#{cid} &middot; {created[:10]}</span></div>
-                        <span class="status-pill {pill}">{status}</span>
+                        <div><span class="room-badge">ห้อง {html.escape(str(rno))}</span>&nbsp;<span style="color:var(--muted);font-size:.85rem;">#{cid} &middot; {html.escape(str(created)[:10])}</span></div>
+                        <span class="status-pill {pill}">{html.escape(str(status))}</span>
                     </div>
                     <div class="kv">
-                        <span>จุดที่แจ้ง</span><b>{cat}</b>
+                        <span>จุดที่แจ้ง</span><b>{html.escape(str(cat))}</b>
                         <span>เงินประกันตั้งต้น</span><b>{dep:,} บาท</b>
                         <span>ยอดหักค่าซ่อม</span><b style="color:var(--brick);">-{deduct:,} บาท</b>
                         <span>คืนสุทธิ (ประเมิน)</span><b style="color:var(--pine);font-size:1.1rem;">{remaining:,} บาท</b>
@@ -428,16 +467,16 @@ def render_tenant():
 # LANDLORD DASHBOARD
 # ==========================================
 def render_landlord():
-    name   = st.session_state.display_name
+    name   = html.escape(st.session_state.display_name or "")
     cursor = conn.cursor()
 
     cursor.execute("SELECT COUNT(*) FROM inspections")
     total_cases = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM inspections WHERE status='🟡 รอการตรวจสอบ'")
+    cursor.execute("SELECT COUNT(*) FROM inspections WHERE status=?", (STATUS_PENDING,))
     pending_count = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM inspections WHERE status='🟢 ประเมินเสร็จสิ้น'")
+    cursor.execute("SELECT COUNT(*) FROM inspections WHERE status=?", (STATUS_DONE,))
     done_count = cursor.fetchone()[0]
-    cursor.execute("SELECT COALESCE(SUM(final_deduct),0) FROM inspections WHERE status='🟢 ประเมินเสร็จสิ้น'")
+    cursor.execute("SELECT COALESCE(SUM(final_deduct),0) FROM inspections WHERE status=?", (STATUS_DONE,))
     total_deducted = cursor.fetchone()[0]
 
     st.markdown(f"""
@@ -467,7 +506,7 @@ def render_landlord():
     ])
 
     with tab_pending:
-        cursor.execute("SELECT id,room_no,tenant_name,deposit,category_th,location,description FROM inspections WHERE status='🟡 รอการตรวจสอบ'")
+        cursor.execute("SELECT id,room_no,tenant_name,deposit,category_th,location,description FROM inspections WHERE status=?", (STATUS_PENDING,))
         pending_cases = cursor.fetchall()
 
         if not pending_cases:
@@ -482,28 +521,40 @@ def render_landlord():
             selected_id    = case_options[selected_label]
             st.markdown('</div>', unsafe_allow_html=True)
 
-            cursor.execute("SELECT room_no,tenant_name,deposit,category_th,location,description FROM inspections WHERE id=?", (selected_id,))
-            room_no, tenant_name, deposit, category_th, location, description = cursor.fetchone()
-            category_key   = [k for k, v in CATEGORY_MAP.items() if v == category_th][0]
-            matching_costs = cost_df[cost_df["category"] == category_key] if not cost_df.empty else pd.DataFrame()
+            cursor.execute("SELECT room_no,tenant_name,deposit,category_th,category_key,location,description,image_path FROM inspections WHERE id=?", (selected_id,))
+            room_no, tenant_name, deposit, category_th, category_key, location, description, image_path = cursor.fetchone()
+            # เคสเก่าที่ยังไม่มี category_key ให้หาจากชื่อหมวด
+            if not category_key:
+                category_key = next((k for k, v in CATEGORY_MAP.items() if v == category_th), None)
+            matching_costs = cost_df[cost_df["category"] == category_key] if (not cost_df.empty and category_key) else pd.DataFrame()
             cost_ref       = matching_costs.to_string(index=False) if not matching_costs.empty else "ไม่มีข้อมูลเรทราคา"
 
+            esc = html.escape   # ป้องกันการแทรก HTML จากข้อมูลที่ผู้เช่ากรอก
             st.markdown(f"""
             <div class="case-card">
                 <div style="margin-bottom:14px;">
-                    <span class="room-badge">ห้อง {room_no}</span>&nbsp;
-                    <span style="font-weight:700;font-size:1.05rem;">{tenant_name}</span>
+                    <span class="room-badge">ห้อง {esc(str(room_no))}</span>&nbsp;
+                    <span style="font-weight:700;font-size:1.05rem;">{esc(str(tenant_name))}</span>
                 </div>
                 <div class="kv">
                     <span>เงินประกันตั้งต้น</span><b>{deposit:,} บาท</b>
-                    <span>หมวดหมู่ความเสียหาย</span><b>{category_th}</b>
-                    <span>ตำแหน่งในห้อง</span><b>{location}</b>
-                    <span>รายละเอียดปัญหา</span><div>{description}</div>
+                    <span>หมวดหมู่ความเสียหาย</span><b>{esc(str(category_th))}</b>
+                    <span>ตำแหน่งในห้อง</span><b>{esc(str(location))}</b>
+                    <span>รายละเอียดปัญหา</span><div>{esc(str(description))}</div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
+            if image_path and os.path.exists(image_path):
+                st.image(image_path, caption="รูปถ่ายที่ผู้เช่าแนบ", width=320)
+
             if st.button("🤖 ให้ AI ประเมินและคำนวณยอดหักประกัน", type="primary"):
+                # เริ่มประเมินใหม่ ล้างผลและค่าที่แก้ไขค้างจากรอบก่อน
+                st.session_state.pop("result", None)
+                st.session_state.pop("draft", None)
+                st.session_state.pop(f"mat_{selected_id}", None)
+                st.session_state.pop(f"lab_{selected_id}", None)
+
                 with st.spinner("กำลังให้ AI วิเคราะห์..."):
                     prompt = f"""
 คุณเป็นผู้ประเมินความเสียหายห้องพัก วิเคราะห์เคสนี้และตอบกลับมาเป็น JSON รูปแบบนี้เท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON:
@@ -520,74 +571,115 @@ def render_landlord():
 - เรทราคาอ้างอิง:
 {cost_ref}
 """
-                    mat_cost, lab_cost, ai_deduct = 0, 0, 0
-                    ai_analysis = "ไม่สามารถวิเคราะห์ได้"
+                    new_draft, error_msg = None, None
                     try:
                         response = requests.post(
-                            "http://localhost:11434/api/generate",
-                            json={"model": "qwen2.5:0.5b", "prompt": prompt, "stream": False},
-                            timeout=30
+                            OLLAMA_URL,
+                            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
+                                  "format": "json", "options": {"temperature": 0}},
+                            timeout=OLLAMA_TIMEOUT
                         )
-                        if response.status_code == 200:
+                        if response.status_code != 200:
+                            error_msg = f"Ollama ตอบกลับด้วยรหัส {response.status_code}"
+                        else:
                             raw = response.json().get("response", "")
                             m = re.search(r'\{.*\}', raw, re.DOTALL)
-                            if m:
+                            if not m:
+                                error_msg = "AI ตอบกลับในรูปแบบที่อ่านไม่ได้ (ไม่พบ JSON)"
+                            else:
                                 jd = json.loads(m.group(0))
-                                ai_analysis = jd.get("analysis", "")
-                                mat_cost    = int(jd.get("material_cost", 0))
-                                lab_cost    = int(jd.get("labor_cost", 0))
-                                ai_deduct   = int(jd.get("suggested_deduct", 0))
-                    except Exception:
-                        ai_analysis = "เกิดข้อผิดพลาดในการเชื่อมต่อ Ollama"
+                                new_draft = {
+                                    "id": selected_id,
+                                    "analysis": str(jd.get("analysis", "")),
+                                    "mat": max(0, int(jd.get("material_cost", 0))),
+                                    "lab": max(0, int(jd.get("labor_cost", 0))),
+                                    "ai_deduct": max(0, int(jd.get("suggested_deduct", 0))),
+                                }
+                    except requests.exceptions.Timeout:
+                        error_msg = f"Ollama ใช้เวลาตอบนานเกิน {OLLAMA_TIMEOUT} วินาที"
+                    except requests.exceptions.ConnectionError:
+                        error_msg = "เชื่อมต่อ Ollama ไม่ได้ ตรวจสอบว่าเปิด Ollama และติดตั้งโมเดลแล้ว"
+                    except Exception as e:
+                        error_msg = f"เกิดข้อผิดพลาดในการประเมิน: {e}"
 
+                if new_draft:
+                    st.session_state["draft"] = new_draft
+                else:
+                    # ไม่บันทึกอะไรลงฐานข้อมูล เคสยังคงสถานะรอการตรวจสอบ
+                    st.error(f"❌ ประเมินไม่สำเร็จ: {error_msg} (เคสนี้ยังคงอยู่ในสถานะรอการตรวจสอบ)")
+
+            # ผลประเมินเบื้องต้นจาก AI ให้เจ้าของห้องตรวจและแก้ไขได้ก่อนบันทึก
+            draft = st.session_state.get("draft")
+            if draft and draft["id"] == selected_id:
+                st.markdown("### 🤖 ผลประเมินเบื้องต้นจาก AI (ตรวจและแก้ไขตัวเลขได้ก่อนบันทึก)")
+                st.markdown(f'<div class="note">{html.escape(draft["analysis"])}</div>', unsafe_allow_html=True)
+                c1, c2 = st.columns(2)
+                mat_cost = c1.number_input("🛠️ ค่าวัสดุ (บาท):", min_value=0, value=draft["mat"], step=50, key=f"mat_{selected_id}")
+                lab_cost = c2.number_input("👷 ค่าแรง (บาท):", min_value=0, value=draft["lab"], step=50, key=f"lab_{selected_id}")
+                st.caption(f"หากค่าวัสดุ + ค่าแรง เป็น 0 ระบบจะใช้ยอดหักที่ AI เสนอ ({draft['ai_deduct']:,} บาท) และยอดหักจะไม่เกินเงินประกัน")
+
+                if st.button("💾 ยืนยันและบันทึกผลการประเมิน", type="primary"):
+                    # PYTHON SANITY CHECK & RE-CALCULATION
                     calc_total   = mat_cost + lab_cost
-                    final_deduct = calc_total if calc_total > 0 else ai_deduct
+                    final_deduct = calc_total if calc_total > 0 else draft["ai_deduct"]
                     if final_deduct > deposit:
                         final_deduct = deposit
                     final_remaining = deposit - final_deduct
 
                     cursor.execute("""
                         UPDATE inspections
-                        SET status='🟢 ประเมินเสร็จสิ้น', mat_cost=?, lab_cost=?, final_deduct=?, final_remaining=?, ai_analysis=?
+                        SET status=?, mat_cost=?, lab_cost=?, final_deduct=?, final_remaining=?, ai_analysis=?
                         WHERE id=?
-                    """, (mat_cost, lab_cost, final_deduct, final_remaining, ai_analysis, selected_id))
+                    """, (STATUS_DONE, mat_cost, lab_cost, final_deduct, final_remaining, draft["analysis"], selected_id))
                     conn.commit()
 
-                    st.success("✅ ประเมินและบันทึกผลสำเร็จ!")
-                    st.markdown("### 📄 ใบสรุปผลการประเมิน")
-                    st.markdown(f"""
-                    <div class="slip">
-                        <div class="slip-head"><span>ใบสรุปการคืนเงินประกัน</span><span>ห้อง {room_no}</span></div>
-                        <div class="slip-row"><span>เงินประกันตั้งต้น</span><b>{deposit:,} บาท</b></div>
-                        <div class="slip-row deduct"><span>ค่าวัสดุและอุปกรณ์</span><b>-{mat_cost:,} บาท</b></div>
-                        <div class="slip-row deduct"><span>ค่าแรงช่าง</span><b>-{lab_cost:,} บาท</b></div>
-                        <div class="slip-row deduct"><span>ยอดหักค่าซ่อมรวม</span><b>-{final_deduct:,} บาท</b></div>
-                        <div class="slip-cut"></div>
-                        <div class="slip-total"><span>คืนผู้เช่าสุทธิ</span><b>{final_remaining:,} บาท</b></div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    st.session_state["result"] = {
+                        "room_no": room_no, "tenant_name": tenant_name, "description": description,
+                        "mat": mat_cost, "lab": lab_cost, "deposit": deposit,
+                        "final_deduct": final_deduct, "final_remaining": final_remaining,
+                        "analysis": draft["analysis"],
+                    }
+                    st.session_state.pop("draft", None)
+                    st.rerun()
 
-                    st.markdown("**💬 เหตุผลการพิจารณาจาก AI:**")
-                    st.markdown(f'<div class="note">{html.escape(ai_analysis)}</div>', unsafe_allow_html=True)
+        # แสดงผลสรุปหลังบันทึก (เก็บใน session_state เพื่อไม่ให้หายเมื่อกดปุ่มอื่น เช่น ดาวน์โหลด)
+        result = st.session_state.get("result")
+        if result:
+            st.success("✅ ประเมินและบันทึกผลสำเร็จ!")
+            st.markdown("### 📄 ใบสรุปผลการประเมิน")
+            st.markdown(f"""
+            <div class="slip">
+                <div class="slip-head"><span>ใบสรุปการคืนเงินประกัน</span><span>ห้อง {html.escape(str(result['room_no']))}</span></div>
+                <div class="slip-row"><span>เงินประกันตั้งต้น</span><b>{result['deposit']:,} บาท</b></div>
+                <div class="slip-row deduct"><span>ค่าวัสดุและอุปกรณ์</span><b>-{result['mat']:,} บาท</b></div>
+                <div class="slip-row deduct"><span>ค่าแรงช่าง</span><b>-{result['lab']:,} บาท</b></div>
+                <div class="slip-row deduct"><span>ยอดหักค่าซ่อมรวม</span><b>-{result['final_deduct']:,} บาท</b></div>
+                <div class="slip-cut"></div>
+                <div class="slip-total"><span>คืนผู้เช่าสุทธิ</span><b>{result['final_remaining']:,} บาท</b></div>
+            </div>
+            """, unsafe_allow_html=True)
 
-                    report_text = f"""--- [ ใบสรุปผลการตรวจสอบห้องพักและหักเงินประกัน ] ---
-ห้อง: {room_no} | ผู้เช่า: {tenant_name}
-ปัญหาที่พบ: {description}
+            st.markdown("**💬 เหตุผลการพิจารณาจาก AI:**")
+            st.markdown(f'<div class="note">{html.escape(result["analysis"])}</div>', unsafe_allow_html=True)
+
+            report_text = f"""--- [ ใบสรุปผลการตรวจสอบห้องพักและหักเงินประกัน ] ---
+ห้อง: {result['room_no']} | ผู้เช่า: {result['tenant_name']}
+ปัญหาที่พบ: {result['description']}
 ----------------------------------------
-- ค่าวัสดุและอุปกรณ์: {mat_cost:,} บาท
-- ค่าแรงช่าง: {lab_cost:,} บาท
-- รวมค่าใช้จ่ายซ่อมแซมทั้งหมด: {final_deduct:,} บาท
-- ยอดเงินประกันตั้งต้น: {deposit:,} บาท
-- ยอดเงินประกันคงเหลือคืนผู้เช่าสุทธิ: {final_remaining:,} บาท
+- ค่าวัสดุและอุปกรณ์: {result['mat']:,} บาท
+- ค่าแรงช่าง: {result['lab']:,} บาท
+- รวมค่าใช้จ่ายซ่อมแซมทั้งหมด: {result['final_deduct']:,} บาท
+- ยอดเงินประกันตั้งต้น: {result['deposit']:,} บาท
+- ยอดเงินประกันคงเหลือคืนผู้เช่าสุทธิ: {result['final_remaining']:,} บาท
 ----------------------------------------
-ความเห็นผู้ตรวจสอบ: {ai_analysis}"""
-                    col_dl1, col_dl2 = st.columns(2)
-                    with col_dl1:
-                        st.text_area("📋 ข้อความสรุปสำหรับส่งให้ผู้เช่า:", report_text, height=150)
-                    with col_dl2:
-                        st.download_button("⬇️ ดาวน์โหลดรายงานสรุป (.txt)", report_text,
-                                           file_name=f"Report_Room_{room_no}.txt", mime="text/plain",
-                                           use_container_width=True)
+ความเห็นผู้ตรวจสอบ: {result['analysis']}"""
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                st.text_area("📋 ข้อความสรุปสำหรับส่งให้ผู้เช่า:", report_text, height=150)
+            with col_dl2:
+                st.download_button("⬇️ ดาวน์โหลดรายงานสรุป (.txt)", report_text,
+                                   file_name=f"Report_Room_{result['room_no']}.txt", mime="text/plain",
+                                   use_container_width=True)
 
     with tab_all:
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
@@ -602,9 +694,12 @@ def render_landlord():
             df_hist.columns = ["รหัส","ห้อง","ผู้เช่า","จุดชำรุด","วันที่แจ้ง","ประกัน (บาท)","สถานะ","หัก (บาท)","คืน (บาท)"]
             st.dataframe(df_hist, use_container_width=True, hide_index=True)
             st.markdown("---")
-            if st.button("🗑️ ล้างประวัติทั้งหมด", type="secondary"):
+            confirm_clear = st.checkbox("ยืนยันว่าต้องการล้างประวัติทั้งหมด (ลบแล้วกู้คืนไม่ได้)")
+            if st.button("🗑️ ล้างประวัติทั้งหมด", type="secondary", disabled=not confirm_clear):
                 conn.cursor().execute("DELETE FROM inspections")
                 conn.commit()
+                st.session_state.pop("draft", None)
+                st.session_state.pop("result", None)
                 st.success("ล้างข้อมูลสำเร็จ!")
                 st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
@@ -624,7 +719,7 @@ def render_landlord():
                 st.markdown("**📊 สัดส่วนสถานะเคส**")
                 st.bar_chart(df_all["status"].value_counts())
             st.markdown("---")
-            done_df = df_all[df_all["status"] == "🟢 ประเมินเสร็จสิ้น"]
+            done_df = df_all[df_all["status"] == STATUS_DONE]
             c1, c2, c3 = st.columns(3)
             with c1:
                 st.metric("ยอดหักเฉลี่ยต่อเคส", f"{int(done_df['final_deduct'].mean()):,} บาท" if not done_df.empty else "—")
