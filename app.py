@@ -6,6 +6,8 @@ import re
 import html
 import os
 import sqlite3
+from perf_monitor import run_with_monitor, log_perf  # วัด latency + CPU/RAM/Temp ของ Pi
+from repair_estimator import load_catalog, filter_by_category, build_prompt, estimate_from_ai
 from datetime import datetime
 
 # ==========================================
@@ -186,7 +188,8 @@ CATEGORY_MAP = {
     "water_network":    "ระบบน้ำและท่อประปา",
     "lighting":         "ระบบแสงสว่างและไฟฟ้า",
     "sanitation":       "สุขภัณฑ์และความสะอาด",
-    "Wall":             "ผนังและกำแพง"
+    "Wall":             "ผนังและกำแพง",
+    "Door":             "ประตู หน้าต่าง และอุปกรณ์ล็อค"
 }
 
 STATUS_PENDING = "🟡 รอการตรวจสอบ"
@@ -213,6 +216,10 @@ def load_cost_db():
 cost_df = load_cost_db()
 if cost_df.empty:
     st.warning("ไม่พบหรืออ่านไฟล์ repair_cost_db.csv ไม่ได้ AI จะประเมินโดยไม่มีเรทราคาอ้างอิง")
+
+@st.cache_data
+def get_catalogs():
+    return load_catalog("materials.csv", "labor.csv")
 
 # ==========================================
 # SESSION STATE INIT
@@ -552,51 +559,57 @@ def render_landlord():
                 # เริ่มประเมินใหม่ ล้างผลและค่าที่แก้ไขค้างจากรอบก่อน
                 st.session_state.pop("result", None)
                 st.session_state.pop("draft", None)
+                st.session_state.pop("perf_text", None)
                 st.session_state.pop(f"mat_{selected_id}", None)
                 st.session_state.pop(f"lab_{selected_id}", None)
 
                 with st.spinner("กำลังให้ AI วิเคราะห์..."):
-                    prompt = f"""
-คุณเป็นผู้ประเมินความเสียหายห้องพัก วิเคราะห์เคสนี้และตอบกลับมาเป็น JSON รูปแบบนี้เท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON:
-{{
-  "analysis": "อธิบายสั้นๆ ว่าความเสียหายนี้ควรหักเงินหรือไม่",
-  "material_cost": ตัวเลขค่าวัสดุเป็น integer เช่น 300,
-  "labor_cost": ตัวเลขค่าแรงเป็น integer เช่น 200,
-  "suggested_deduct": ตัวเลขยอดหักเงินรวมเป็น integer เช่น 500
-}}
+                    all_mats, all_jobs = get_catalogs()
+                    sub_mats = filter_by_category(all_mats, category_key, description)
+                    sub_jobs = filter_by_category(all_jobs, category_key, description)
+                    prompt = build_prompt(category_th, description, location, sub_mats, sub_jobs)
 
-ข้อมูลเคส:
-- เงินประกันตั้งต้น: {deposit} บาท
-- ปัญหา: [{category_th}] {description} ({location})
-- เรทราคาอ้างอิง:
-{cost_ref}
-"""
                     new_draft, error_msg = None, None
                     try:
-                        response = requests.post(
+                        response, perf = run_with_monitor(
+                            requests.post,
                             OLLAMA_URL,
-                            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
-                                  "format": "json", "options": {"temperature": 0}},
-                            timeout=OLLAMA_TIMEOUT
+                            json={
+                                "model": OLLAMA_MODEL,
+                                "prompt": prompt,
+                                "stream": False,
+                                "format": "json",
+                                "options": {
+                                    "temperature": 0,
+                                    "num_predict": 120,
+                                    "num_ctx": 1024,
+                                }
+                            },
+                            timeout=60
                         )
                         if response.status_code != 200:
                             error_msg = f"Ollama ตอบกลับด้วยรหัส {response.status_code}"
                         else:
+                            # พิมพ์สรุป latency/CPU/RAM/Temp ลง terminal + บันทึก perf_log.csv
+                            st.session_state["perf_text"] = log_perf(selected_id, perf, response.json(), OLLAMA_MODEL)
                             raw = response.json().get("response", "")
                             m = re.search(r'\{.*\}', raw, re.DOTALL)
                             if not m:
                                 error_msg = "AI ตอบกลับในรูปแบบที่อ่านไม่ได้ (ไม่พบ JSON)"
                             else:
                                 jd = json.loads(m.group(0))
+                                est = estimate_from_ai(jd, all_mats, all_jobs, original_desc=description)
                                 new_draft = {
                                     "id": selected_id,
-                                    "analysis": str(jd.get("analysis", "")),
-                                    "mat": max(0, int(jd.get("material_cost", 0))),
-                                    "lab": max(0, int(jd.get("labor_cost", 0))),
-                                    "ai_deduct": max(0, int(jd.get("suggested_deduct", 0))),
+                                    "analysis": est["analysis"],
+                                    "mat": est["mat"],
+                                    "lab": est["lab"],
+                                    "ai_deduct": est["ai_deduct"],
+                                    "items": est.get("items", []),
+                                    "jobs": est.get("jobs", []),
                                 }
                     except requests.exceptions.Timeout:
-                        error_msg = f"Ollama ใช้เวลาตอบนานเกิน {OLLAMA_TIMEOUT} วินาที"
+                        error_msg = "Ollama ใช้เวลาตอบนานเกิน 60 วินาที"
                     except requests.exceptions.ConnectionError:
                         error_msg = "เชื่อมต่อ Ollama ไม่ได้ ตรวจสอบว่าเปิด Ollama และติดตั้งโมเดลแล้ว"
                     except Exception as e:
@@ -612,7 +625,9 @@ def render_landlord():
             draft = st.session_state.get("draft")
             if draft and draft["id"] == selected_id:
                 st.markdown("### 🤖 ผลประเมินเบื้องต้นจาก AI (ตรวจและแก้ไขตัวเลขได้ก่อนบันทึก)")
-                st.markdown(f'<div class="note">{html.escape(draft["analysis"])}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="note" style="white-space:pre-wrap;line-height:1.6;">{html.escape(draft["analysis"])}</div>', unsafe_allow_html=True)
+                if st.session_state.get("perf_text"):
+                    st.caption(st.session_state["perf_text"])
                 c1, c2 = st.columns(2)
                 mat_cost = c1.number_input("🛠️ ค่าวัสดุ (บาท):", min_value=0, value=draft["mat"], step=50, key=f"mat_{selected_id}")
                 lab_cost = c2.number_input("👷 ค่าแรง (บาท):", min_value=0, value=draft["lab"], step=50, key=f"lab_{selected_id}")
